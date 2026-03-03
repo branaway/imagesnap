@@ -92,6 +92,54 @@ snapshot-00004.jpg
 snapshot-00005.jpg
 ```
 
+### Resolution and size
+
+Capture at the **largest resolution** your device supports with `-M`:
+
+```
+$ imagesnap -M snapshot.jpg
+```
+
+To use a specific size, use `-s WxH`. List supported sizes for the selected device with `-S`:
+
+```
+$ imagesnap -S
+Supported capture sizes for "FaceTime HD Camera":
+  320x240
+  640x480
+  1280x720
+  1920x1080
+$ imagesnap -s 1920x1080 out.jpg
+```
+
+### Image enhancements
+
+You can optionally apply **auto contrast**, **denoise**, and **sharpen** (individually or together):
+
+- **`-e`** – apply all three (contrast, denoise, sharpen)
+- **`-c`** – auto contrast only (histogram stretch)
+- **`--denoise`** – noise reduction
+- **`--sharpen`** – luminance sharpening
+
+```
+$ imagesnap -e snapshot.jpg
+$ imagesnap -c --sharpen doc.jpg
+```
+
+### Reducing noise with multiple frames
+
+Averaging or taking the median of several frames reduces noise without blurring the scene (hold the camera still or use a tripod).
+
+- **`-a N`** – capture N frames and merge by **mean** (good for general noise)
+- **`--median N`** – capture N frames and merge by **median** (better for salt-and-pepper noise and text; preserves edges)
+
+```
+$ imagesnap -a 8 snapshot.jpg
+$ imagesnap --median 5 -e snapshot.jpg
+```
+
+Both options work in timelapse mode too (each output image is the mean or median of N captures).
+
 There is a default warmup period of three seconds when you take a picture. This gives the camera time to get its sensors all set up. Your camera might have a faster or slower response time, so you can adjust the warmup period to suit your needs:
 
 ```
@@ -114,9 +162,18 @@ Supported image types: JPEG, TIFF, PNG, GIF, BMP
   -l          List available video devices
   -t x.xx     Take a picture every x.xx seconds
   -n x        Limit the number of timelapse pictures to x
+  -s WxH      Capture at camera-supported size only (use -S to list sizes)
+  -M          Capture at the largest size supported by the device
+  -S          List supported capture sizes for the selected device
   -q          Quiet mode. Do not output any text
   -w x.xx     Warmup. Delay snapshot x.xx seconds after turning on camera
   -d device   Use named video device
+  -e          Apply all enhancements (contrast, denoise, sharpen)
+  -c          Auto contrast
+  --denoise   Noise reduction
+  --sharpen   Sharpen
+  -a N        Average N frames into one image (reduces noise)
+  --median N  Median of N frames (better for salt-and-pepper noise, preserves edges)
 ```
 
 ## Image Formats
@@ -132,6 +189,9 @@ The following image formats are supported and are determined by the filename ext
 ## Changes
 
 - v0.3.0 - Complete rewrite in Swift using AVFoundation. Supports macOS 13+.
+- Image enhancements: auto contrast (`-c`), denoise (`--denoise`), sharpen (`--sharpen`), or all with `-e`.
+- Resolution: `-s WxH` for a specific size, `-S` to list sizes, `-M` for maximum resolution.
+- Frame merging: `-a N` (mean of N frames) and `--median N` (median of N frames) to reduce noise; median is better for salt-and-pepper noise and preserves text/edges.
 
 ## Requirements
 
