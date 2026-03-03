@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreImage
+import CoreMedia
 import AppKit
 import Foundation
 
@@ -14,11 +15,19 @@ struct Arguments {
     var verbose: Bool = false
     var quiet: Bool = false
     var listDevices: Bool = false
+    var listSizes: Bool = false  // -S: list supported capture sizes for device
     var deviceName: String? = nil
     var warmupDelay: Double = 3.0  // Default 3 seconds (matches v0.2.13+)
     var timelapse: Double? = nil   // Interval in seconds
     var maxCaptures: Int? = nil    // -n flag: limit number of timelapse pictures
+    var imageSize: (width: Int, height: Int)? = nil  // -s WxH: output dimensions
+    var requestMaxSize: Bool = false  // -M: use largest supported size
     var filename: String = "snapshot.jpg"
+    var enableContrast: Bool = false
+    var enableDenoise: Bool = false
+    var enableSharpen: Bool = false
+    var averageFrames: Int? = nil  // -a N: capture N frames and merge (mean) to reduce noise
+    var medianFrames: Int? = nil  // --median N: capture N frames and merge (median) to reduce salt-and-pepper noise
     
     static func parse() -> Arguments {
         var args = Arguments()
@@ -29,7 +38,7 @@ struct Arguments {
             let arg = arguments[i]
             
             switch arg {
-            case "-h":
+            case "-h", "--help":
                 args.showHelp = true
             case "-v":
                 args.verbose = true
@@ -37,6 +46,8 @@ struct Arguments {
                 args.quiet = true
             case "-l":
                 args.listDevices = true
+            case "-S":
+                args.listSizes = true
             case "-d":
                 i += 1
                 if i < arguments.count {
@@ -56,6 +67,39 @@ struct Arguments {
                 i += 1
                 if i < arguments.count, let count = Int(arguments[i]) {
                     args.maxCaptures = count
+                }
+            case "-s":
+                i += 1
+                if i < arguments.count {
+                    let parts = arguments[i].split(separator: "x", omittingEmptySubsequences: false)
+                    if parts.count == 2,
+                       let w = Int(parts[0].trimmingCharacters(in: .whitespaces)),
+                       let h = Int(parts[1].trimmingCharacters(in: .whitespaces)),
+                       w > 0, h > 0 {
+                        args.imageSize = (width: w, height: h)
+                    }
+                }
+            case "-M", "--max-size":
+                args.requestMaxSize = true
+            case "-e", "--enhance":
+                args.enableContrast = true
+                args.enableDenoise = true
+                args.enableSharpen = true
+            case "-c", "--contrast":
+                args.enableContrast = true
+            case "--denoise":
+                args.enableDenoise = true
+            case "--sharpen":
+                args.enableSharpen = true
+            case "-a", "--average":
+                i += 1
+                if i < arguments.count, let n = Int(arguments[i]), n > 0 {
+                    args.averageFrames = n
+                }
+            case "--median":
+                i += 1
+                if i < arguments.count, let n = Int(arguments[i]), n > 0 {
+                    args.medianFrames = n
                 }
             default:
                 // If it's not a flag, treat as filename
@@ -84,9 +128,18 @@ struct Arguments {
           -l          List available video devices
           -t x.xx     Take a picture every x.xx seconds
           -n x        Limit the number of timelapse pictures to x
+          -s WxH      Capture at camera-supported size only (use -S to list sizes)
+          -M          Capture at the largest size supported by the device
+          -S          List supported capture sizes for the selected device
           -q          Quiet mode. Do not output any text
           -w x.xx     Warmup. Delay snapshot x.xx seconds after turning on camera
           -d device   Use named video device
+          -e          Apply all enhancements (contrast, denoise, sharpen)
+          -c          Auto contrast
+          --denoise   Noise reduction
+          --sharpen   Sharpen
+          -a N        Average N frames into one image (reduces noise)
+          --median N  Median of N frames (better for salt-and-pepper noise, preserves edges)
         """
         print(help)
     }
@@ -186,13 +239,70 @@ class CameraManager: NSObject {
         return currentDevice?.localizedName ?? "Unknown"
     }
     
-    func setupSession(device: AVCaptureDevice) -> Bool {
+    /// Dimensions from a device format (video capture size).
+    private static func dimensions(of format: AVCaptureDevice.Format) -> (width: Int, height: Int) {
+        let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+        return (width: Int(dims.width), height: Int(dims.height))
+    }
+    
+    /// All unique capture sizes supported by the device, sorted (smallest first).
+    static func supportedSizes(for device: AVCaptureDevice) -> [(width: Int, height: Int)] {
+        var set = Set<String>()
+        var out: [(width: Int, height: Int)] = []
+        for format in device.formats {
+            let d = dimensions(of: format)
+            let key = "\(d.width)x\(d.height)"
+            if set.insert(key).inserted {
+                out.append(d)
+            }
+        }
+        out.sort { a, b in
+            if a.width != b.width { return a.width < b.width }
+            return a.height < b.height
+        }
+        return out
+    }
+    
+    /// A format on this device that matches the given size, or nil.
+    static func format(matching size: (width: Int, height: Int), on device: AVCaptureDevice) -> AVCaptureDevice.Format? {
+        device.formats.first { dimensions(of: $0) == size }
+    }
+    
+    static func printSupportedSizes(for device: AVCaptureDevice) {
+        let sizes = supportedSizes(for: device)
+        if sizes.isEmpty {
+            print("No supported capture sizes reported for \"\(device.localizedName)\".")
+            return
+        }
+        print("Supported capture sizes for \"\(device.localizedName)\":")
+        for s in sizes {
+            print("  \(s.width)x\(s.height)")
+        }
+    }
+    
+    func setupSession(device: AVCaptureDevice, requestedSize: (width: Int, height: Int)? = nil) -> Bool {
         currentDevice = device
         
         Output.verboseLog("Setting up capture session for device: \(device.localizedName)")
         
+        if let size = requestedSize {
+            guard let format = Self.format(matching: size, on: device) else {
+                Output.error("Error: Size \(size.width)x\(size.height) is not supported by this device. Use -S to list supported sizes.")
+                return false
+            }
+            do {
+                try device.lockForConfiguration()
+                device.activeFormat = format
+                device.unlockForConfiguration()
+            } catch {
+                Output.error("Error: Could not set device format: \(error.localizedDescription)")
+                return false
+            }
+            Output.verboseLog("Using device format \(size.width)x\(size.height)")
+        }
+        
         captureSession = AVCaptureSession()
-        captureSession?.sessionPreset = .photo
+        captureSession?.sessionPreset = (requestedSize != nil) ? .high : .photo
         
         do {
             let input = try AVCaptureDeviceInput(device: device)
@@ -324,6 +434,308 @@ extension CameraManager: AVCapturePhotoCaptureDelegate {
     }
 }
 
+// MARK: - Auto Contrast (Core Image)
+
+/// Convert NSImage to CIImage for processing.
+private func ciImage(from image: NSImage) -> CIImage? {
+    guard let tiffData = image.tiffRepresentation,
+          let bitmapRep = NSBitmapImageRep(data: tiffData),
+          let cgImage = bitmapRep.cgImage else { return nil }
+    return CIImage(cgImage: cgImage)
+}
+
+/// Render CIImage to NSImage.
+private func nsImage(from ciImage: CIImage, context: CIContext) -> NSImage? {
+    let extent = ciImage.extent
+    guard extent.width > 0, extent.height > 0,
+          let cgImage = context.createCGImage(ciImage, from: extent) else { return nil }
+    return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+}
+
+/// Compute 2nd and 98th percentile bin index (0–255) for one channel from histogram counts.
+private func percentileBounds(counts: [Float], lowPercentile: Float = 0.02, highPercentile: Float = 0.98) -> (low: Int, high: Int) {
+    let total = counts.reduce(0, +)
+    guard total > 0 else { return (0, 255) }
+    var cum: Float = 0
+    var low = 0
+    var high = 255
+    for (i, c) in counts.enumerated() {
+        cum += c
+        if low == 0 && cum >= total * lowPercentile { low = i }
+        if cum >= total * highPercentile { high = i; break }
+    }
+    if low >= high { high = min(255, low + 1) }
+    return (low, high)
+}
+
+/// Apply auto contrast by stretching each channel so 2nd–98th percentile maps to full range.
+func applyAutoContrast(to image: NSImage) -> NSImage? {
+    guard let inputCIImage = ciImage(from: image) else { return nil }
+    let context = CIContext(options: [.useSoftwareRenderer: false])
+    let extent = inputCIImage.extent
+    guard extent.width > 0, extent.height > 0 else { return nil }
+
+    // Build 256-bin area histogram (one pixel per bin; R,G,B = counts per channel).
+    guard let histogramFilter = CIFilter(name: "CIAreaHistogram") else { return nil }
+    histogramFilter.setValue(inputCIImage, forKey: kCIInputImageKey)
+    histogramFilter.setValue(CIVector(cgRect: extent), forKey: kCIInputExtentKey)
+    histogramFilter.setValue(256, forKey: "InputCount")
+    histogramFilter.setValue(1, forKey: "InputScale")
+    guard let histogramCIImage = histogramFilter.outputImage else { return nil }
+
+    // Render histogram to float buffer to read counts (avoids 8-bit clamping).
+    let rowBytes = 256 * 4 * 4 // 256 pixels, RGBA, 4 bytes per float
+    var histogramBuffer = [Float](repeating: 0, count: 256 * 4)
+    context.render(
+        histogramCIImage,
+        toBitmap: &histogramBuffer,
+        rowBytes: rowBytes,
+        bounds: CGRect(x: 0, y: 0, width: 256, height: 1),
+        format: .RGBAf,
+        colorSpace: nil
+    )
+
+    var rCounts = [Float](repeating: 0, count: 256)
+    var gCounts = [Float](repeating: 0, count: 256)
+    var bCounts = [Float](repeating: 0, count: 256)
+    for i in 0..<256 {
+        rCounts[i] = histogramBuffer[i * 4 + 0]
+        gCounts[i] = histogramBuffer[i * 4 + 1]
+        bCounts[i] = histogramBuffer[i * 4 + 2]
+    }
+
+    let (rLow, rHigh) = percentileBounds(counts: rCounts)
+    let (gLow, gHigh) = percentileBounds(counts: gCounts)
+    let (bLow, bHigh) = percentileBounds(counts: bCounts)
+
+    // CIColorMatrix works in 0–1; bins map to intensity i/255. Map [low/255, high/255] -> [0, 1]: scale = 255/(high-low), bias = -low/(high-low).
+    func scaleAndBias(low: Int, high: Int) -> (scale: Float, bias: Float) {
+        let span = Float(high - low)
+        guard span > 0 else { return (1, 0) }
+        return (255 / span, -Float(low) / span)
+    }
+    let (rS, rB) = scaleAndBias(low: rLow, high: rHigh)
+    let (gS, gB) = scaleAndBias(low: gLow, high: gHigh)
+    let (bS, bB) = scaleAndBias(low: bLow, high: bHigh)
+
+    guard let matrixFilter = CIFilter(name: "CIColorMatrix") else { return nil }
+    matrixFilter.setValue(inputCIImage, forKey: kCIInputImageKey)
+    matrixFilter.setValue(CIVector(x: CGFloat(rS), y: 0, z: 0, w: 0), forKey: "inputRVector")
+    matrixFilter.setValue(CIVector(x: 0, y: CGFloat(gS), z: 0, w: 0), forKey: "inputGVector")
+    matrixFilter.setValue(CIVector(x: 0, y: 0, z: CGFloat(bS), w: 0), forKey: "inputBVector")
+    matrixFilter.setValue(CIVector(x: CGFloat(rB), y: CGFloat(gB), z: CGFloat(bB), w: 0), forKey: "inputBiasVector")
+    guard let outputCIImage = matrixFilter.outputImage else { return nil }
+
+    return nsImage(from: outputCIImage, context: context)
+}
+
+/// Apply noise reduction (CINoiseReduction). Use before sharpening.
+private func applyDenoise(to image: NSImage, context: CIContext) -> NSImage? {
+    guard let input = ciImage(from: image) else { return nil }
+    guard let filter = CIFilter(name: "CINoiseReduction") else { return nil }
+    filter.setValue(input, forKey: kCIInputImageKey)
+    filter.setValue(0.02, forKey: "inputNoiseLevel")
+    filter.setValue(0.40, forKey: "inputSharpness")
+    guard let output = filter.outputImage else { return nil }
+    return nsImage(from: output, context: context)
+}
+
+/// Apply luminance sharpening (CISharpenLuminance).
+private func applySharpen(to image: NSImage, context: CIContext) -> NSImage? {
+    guard let input = ciImage(from: image) else { return nil }
+    guard let filter = CIFilter(name: "CISharpenLuminance") else { return nil }
+    filter.setValue(input, forKey: kCIInputImageKey)
+    filter.setValue(0.5, forKey: "inputSharpness")
+    guard let output = filter.outputImage else { return nil }
+    return nsImage(from: output, context: context)
+}
+
+/// Apply only the requested enhancements. Order: contrast → denoise → sharpen.
+func processSnapshot(_ image: NSImage, contrast: Bool, denoise: Bool, sharpen: Bool) -> NSImage {
+    guard contrast || denoise || sharpen else { return image }
+    let context = CIContext(options: [.useSoftwareRenderer: false])
+    var current = image
+    if contrast { current = applyAutoContrast(to: current) ?? current }
+    if denoise { current = applyDenoise(to: current, context: context) ?? current }
+    if sharpen { current = applySharpen(to: current, context: context) ?? current }
+    return current
+}
+
+/// Merge multiple images by per-pixel arithmetic mean in the same color space as the source.
+/// Done in bitmap space to avoid Core Image's linear-space blending (which darkens when adding).
+func meanImage(images: [NSImage], context: CIContext) -> NSImage? {
+    guard let firstData = images.first?.tiffRepresentation,
+          let firstRep = NSBitmapImageRep(data: firstData) else { return nil }
+    let w = firstRep.pixelsWide
+    let h = firstRep.pixelsHigh
+    let n = images.count
+    guard w > 0, h > 0, n > 0 else { return nil }
+
+    // Accumulate R,G,B as Double to avoid rounding errors
+    var sumR = [Double](repeating: 0, count: w * h)
+    var sumG = [Double](repeating: 0, count: w * h)
+    var sumB = [Double](repeating: 0, count: w * h)
+
+    for image in images {
+        guard let tiffData = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiffData),
+              rep.pixelsWide == w, rep.pixelsHigh == h else { return nil }
+        guard let data = rep.bitmapData else { return nil }
+        let bpp = rep.bitsPerPixel / 8
+        let bpr = rep.bytesPerRow
+        let spp = rep.samplesPerPixel
+        for y in 0..<h {
+            for x in 0..<w {
+                let offset = y * bpr + x * bpp
+                let r = Double(data[offset])
+                let g = spp >= 2 ? Double(data[offset + 1]) : r
+                let b = spp >= 3 ? Double(data[offset + 2]) : r
+                let i = y * w + x
+                sumR[i] += r
+                sumG[i] += g
+                sumB[i] += b
+            }
+        }
+    }
+
+    // Build output bitmap: mean per channel, same layout as first rep
+    let bpr = firstRep.bytesPerRow
+    guard let outRep = NSBitmapImageRep(
+        bitmapDataPlanes: nil,
+        pixelsWide: w,
+        pixelsHigh: h,
+        bitsPerSample: firstRep.bitsPerSample,
+        samplesPerPixel: firstRep.samplesPerPixel,
+        hasAlpha: firstRep.hasAlpha,
+        isPlanar: false,
+        colorSpaceName: firstRep.colorSpaceName,
+        bytesPerRow: bpr,
+        bitsPerPixel: firstRep.bitsPerPixel
+    ) else { return nil }
+    guard let outData = outRep.bitmapData else { return nil }
+    let outBpp = outRep.bitsPerPixel / 8
+    let outBpr = outRep.bytesPerRow
+    let outSpp = outRep.samplesPerPixel
+    let invN = 1.0 / Double(n)
+    for y in 0..<h {
+        for x in 0..<w {
+            let i = y * w + x
+            let offset = y * outBpr + x * outBpp
+            outData[offset] = UInt8(min(255, max(0, sumR[i] * invN)))
+            if outSpp >= 2 { outData[offset + 1] = UInt8(min(255, max(0, sumG[i] * invN))) }
+            if outSpp >= 3 { outData[offset + 2] = UInt8(min(255, max(0, sumB[i] * invN))) }
+            if outSpp >= 4 { outData[offset + 3] = 255 }
+        }
+    }
+
+    let outImage = NSImage(size: NSSize(width: w, height: h))
+    outImage.addRepresentation(outRep)
+    return outImage
+}
+
+/// Merge multiple images by per-pixel median. Better for salt-and-pepper noise and preserves edges.
+func medianImage(images: [NSImage], context: CIContext) -> NSImage? {
+    guard let firstData = images.first?.tiffRepresentation,
+          let firstRep = NSBitmapImageRep(data: firstData) else { return nil }
+    let w = firstRep.pixelsWide
+    let h = firstRep.pixelsHigh
+    let n = images.count
+    guard w > 0, h > 0, n > 0 else { return nil }
+
+    // Collect per-pixel values from all images (reused for each pixel)
+    var rVals = [UInt8](repeating: 0, count: n)
+    var gVals = [UInt8](repeating: 0, count: n)
+    var bVals = [UInt8](repeating: 0, count: n)
+
+    // Load all images into a flat buffer [img][y][x] for each channel so we can median per pixel
+    var allR = [[UInt8]](repeating: [], count: n)
+    var allG = [[UInt8]](repeating: [], count: n)
+    var allB = [[UInt8]](repeating: [], count: n)
+    let pixels = w * h
+    for (idx, image) in images.enumerated() {
+        guard let tiffData = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiffData),
+              rep.pixelsWide == w, rep.pixelsHigh == h,
+              let data = rep.bitmapData else { return nil }
+        let bpp = rep.bitsPerPixel / 8
+        let bpr = rep.bytesPerRow
+        let spp = rep.samplesPerPixel
+        allR[idx] = [UInt8](repeating: 0, count: pixels)
+        allG[idx] = [UInt8](repeating: 0, count: pixels)
+        allB[idx] = [UInt8](repeating: 0, count: pixels)
+        for y in 0..<h {
+            for x in 0..<w {
+                let offset = y * bpr + x * bpp
+                let i = y * w + x
+                allR[idx][i] = data[offset]
+                allG[idx][i] = spp >= 2 ? data[offset + 1] : data[offset]
+                allB[idx][i] = spp >= 3 ? data[offset + 2] : data[offset]
+            }
+        }
+    }
+
+    func medianOf(_ a: inout [UInt8]) -> UInt8 {
+        a.sort()
+        return a[n / 2]
+    }
+
+    let bpr = firstRep.bytesPerRow
+    guard let outRep = NSBitmapImageRep(
+        bitmapDataPlanes: nil,
+        pixelsWide: w,
+        pixelsHigh: h,
+        bitsPerSample: firstRep.bitsPerSample,
+        samplesPerPixel: firstRep.samplesPerPixel,
+        hasAlpha: firstRep.hasAlpha,
+        isPlanar: false,
+        colorSpaceName: firstRep.colorSpaceName,
+        bytesPerRow: bpr,
+        bitsPerPixel: firstRep.bitsPerPixel
+    ) else { return nil }
+    guard let outData = outRep.bitmapData else { return nil }
+    let outBpp = outRep.bitsPerPixel / 8
+    let outBpr = outRep.bytesPerRow
+    let outSpp = outRep.samplesPerPixel
+    for y in 0..<h {
+        for x in 0..<w {
+            let i = y * w + x
+            for k in 0..<n {
+                rVals[k] = allR[k][i]
+                gVals[k] = allG[k][i]
+                bVals[k] = allB[k][i]
+            }
+            let offset = y * outBpr + x * outBpp
+            outData[offset] = medianOf(&rVals)
+            if outSpp >= 2 { outData[offset + 1] = medianOf(&gVals) }
+            if outSpp >= 3 { outData[offset + 2] = medianOf(&bVals) }
+            if outSpp >= 4 { outData[offset + 3] = 255 }
+        }
+    }
+
+    let outImage = NSImage(size: NSSize(width: w, height: h))
+    outImage.addRepresentation(outRep)
+    return outImage
+}
+
+/// Capture N frames and merge with mean or median; single frame if N == 1. Caller ensures camera is running.
+func captureMerged(camera: CameraManager, frameCount: Int, useMedian: Bool) -> NSImage? {
+    guard frameCount >= 1 else { return nil }
+    if frameCount == 1 {
+        return camera.capturePhoto()
+    }
+    Output.verboseLog(useMedian ? "Median of \(frameCount) frames..." : "Averaging \(frameCount) frames...")
+    var frames: [NSImage] = []
+    for _ in 0..<frameCount {
+        guard let img = camera.capturePhoto() else { return nil }
+        frames.append(img)
+    }
+    let context = CIContext(options: [.useSoftwareRenderer: false])
+    if useMedian {
+        return medianImage(images: frames, context: context) ?? frames.first
+    }
+    return meanImage(images: frames, context: context) ?? frames.first
+}
+
 // MARK: - Filename Utilities
 
 func generateTimelapseFilename(base: String, index: Int) -> String {
@@ -386,6 +798,21 @@ func main() -> Int32 {
         return 0
     }
     
+    // Resolve device early so we can list sizes or validate -s
+    guard let device = CameraManager.findDevice(matching: args.deviceName) else {
+        if let name = args.deviceName {
+            Output.error("Error: No video device found matching \"\(name)\"")
+        } else {
+            Output.error("Error: No video devices available.")
+        }
+        return 1
+    }
+    
+    if args.listSizes {
+        CameraManager.printSupportedSizes(for: device)
+        return 0
+    }
+    
     // Check camera authorization status
     let authStatus = AVCaptureDevice.authorizationStatus(for: .video)
     
@@ -412,19 +839,23 @@ func main() -> Int32 {
         break
     }
     
-    // Find the device
-    guard let device = CameraManager.findDevice(matching: args.deviceName) else {
-        if let name = args.deviceName {
-            Output.error("Error: No video device found matching \"\(name)\"")
-        } else {
-            Output.error("Error: No video devices available.")
-        }
-        return 1
-    }
-    
     let camera = CameraManager()
     
-    guard camera.setupSession(device: device) else {
+    let requestedSize: (width: Int, height: Int)?
+    if args.requestMaxSize {
+        let sizes = CameraManager.supportedSizes(for: device)
+        if let largest = sizes.last {
+            requestedSize = largest
+            Output.verboseLog("Using maximum size: \(largest.width)x\(largest.height)")
+        } else {
+            Output.error("Error: No supported capture sizes reported for this device.")
+            return 1
+        }
+    } else {
+        requestedSize = args.imageSize
+    }
+    
+    guard camera.setupSession(device: device, requestedSize: requestedSize) else {
         return 1
     }
     
@@ -464,13 +895,16 @@ func main() -> Int32 {
             
             let outputPath = generateTimelapseFilename(base: args.filename, index: sequenceNumber)
             
-            guard let image = camera.capturePhoto() else {
+            let frameCount = args.medianFrames ?? args.averageFrames ?? 1
+            let useMedian = args.medianFrames != nil
+            guard let image = captureMerged(camera: camera, frameCount: frameCount, useMedian: useMedian) else {
                 Output.error("Error: Failed to capture photo.")
                 camera.stopSession()
                 return 1
             }
             
-            if camera.saveImage(image, to: outputPath) {
+            let imageToSave = processSnapshot(image, contrast: args.enableContrast, denoise: args.enableDenoise, sharpen: args.enableSharpen)
+            if camera.saveImage(imageToSave, to: outputPath) {
                 Output.log(outputPath)
             } else {
                 Output.error("Error: Failed to save image to \(outputPath)")
@@ -490,13 +924,16 @@ func main() -> Int32 {
         }
     } else {
         // Single capture mode
-        guard let image = camera.capturePhoto() else {
+        let frameCount = args.medianFrames ?? args.averageFrames ?? 1
+        let useMedian = args.medianFrames != nil
+        guard let image = captureMerged(camera: camera, frameCount: frameCount, useMedian: useMedian) else {
             Output.error("Error: Failed to capture photo.")
             camera.stopSession()
             return 1
         }
         
-        if camera.saveImage(image, to: args.filename) {
+        let imageToSave = processSnapshot(image, contrast: args.enableContrast, denoise: args.enableDenoise, sharpen: args.enableSharpen)
+        if camera.saveImage(imageToSave, to: args.filename) {
             Output.log(args.filename)
         } else {
             Output.error("Error: Failed to save image to \(args.filename)")
