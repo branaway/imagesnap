@@ -28,6 +28,7 @@ struct Arguments {
     var enableSharpen: Bool = false
     var averageFrames: Int? = nil  // -a N: capture N frames and merge (mean) to reduce noise
     var medianFrames: Int? = nil  // --median N: capture N frames and merge (median) to reduce salt-and-pepper noise
+    var parseError: String? = nil  // Set when an unknown or invalid option is seen
     
     static func parse() -> Arguments {
         var args = Arguments()
@@ -102,8 +103,9 @@ struct Arguments {
                     args.medianFrames = n
                 }
             default:
-                // If it's not a flag, treat as filename
-                if !arg.hasPrefix("-") {
+                if arg.hasPrefix("-") {
+                    args.parseError = "Unknown option: \(arg). Use -h for help."
+                } else {
                     args.filename = arg
                 }
             }
@@ -179,6 +181,8 @@ class CameraManager: NSObject {
     private var capturedImage: NSImage?
     private var captureComplete = false
     private var captureError: Error?
+    /// On macOS, we keep the device locked until after startRunning() so the session doesn't override activeFormat.
+    private var deviceLockedForCustomFormat = false
     
     // Get all available video capture devices
     static func listDevices() -> [AVCaptureDevice] {
@@ -285,24 +289,44 @@ class CameraManager: NSObject {
         
         Output.verboseLog("Setting up capture session for device: \(device.localizedName)")
         
+        let customFormat: AVCaptureDevice.Format?
         if let size = requestedSize {
             guard let format = Self.format(matching: size, on: device) else {
                 Output.error("Error: Size \(size.width)x\(size.height) is not supported by this device. Use -S to list supported sizes.")
                 return false
             }
+            customFormat = format
+            Output.verboseLog("Using device format \(size.width)x\(size.height)")
+        } else {
+            customFormat = nil
+        }
+        
+        captureSession = AVCaptureSession()
+        captureSession?.beginConfiguration()
+        defer { captureSession?.commitConfiguration() }
+        
+        if let format = customFormat {
             do {
                 try device.lockForConfiguration()
                 device.activeFormat = format
+                #if os(iOS) || (os(macOS) && targetEnvironment(macCatalyst))
                 device.unlockForConfiguration()
+                #else
+                // macOS: keep lock until after startRunning() so session preset doesn't override activeFormat
+                deviceLockedForCustomFormat = true
+                #endif
             } catch {
                 Output.error("Error: Could not set device format: \(error.localizedDescription)")
                 return false
             }
-            Output.verboseLog("Using device format \(size.width)x\(size.height)")
+            #if os(iOS) || (os(macOS) && targetEnvironment(macCatalyst))
+            captureSession?.sessionPreset = .inputPriority
+            #else
+            // macOS: do not set sessionPreset so the session uses the device's activeFormat
+            #endif
+        } else {
+            captureSession?.sessionPreset = .photo
         }
-        
-        captureSession = AVCaptureSession()
-        captureSession?.sessionPreset = (requestedSize != nil) ? .high : .photo
         
         do {
             let input = try AVCaptureDeviceInput(device: device)
@@ -311,6 +335,7 @@ class CameraManager: NSObject {
                 captureSession?.addInput(input)
             } else {
                 Output.error("Error: Cannot add camera input to session.")
+                if deviceLockedForCustomFormat { device.unlockForConfiguration(); deviceLockedForCustomFormat = false }
                 return false
             }
             
@@ -321,6 +346,7 @@ class CameraManager: NSObject {
                 captureSession?.addOutput(photoOutput)
             } else {
                 Output.error("Error: Cannot add photo output to session.")
+                if deviceLockedForCustomFormat { device.unlockForConfiguration(); deviceLockedForCustomFormat = false }
                 return false
             }
             
@@ -328,6 +354,7 @@ class CameraManager: NSObject {
             
         } catch {
             Output.error("Error setting up camera: \(error.localizedDescription)")
+            if deviceLockedForCustomFormat { device.unlockForConfiguration(); deviceLockedForCustomFormat = false }
             return false
         }
     }
@@ -335,11 +362,19 @@ class CameraManager: NSObject {
     func startSession() {
         Output.verboseLog("Starting capture session...")
         captureSession?.startRunning()
+        if deviceLockedForCustomFormat, let device = currentDevice {
+            device.unlockForConfiguration()
+            deviceLockedForCustomFormat = false
+        }
     }
     
     func stopSession() {
         Output.verboseLog("Stopping capture session...")
         captureSession?.stopRunning()
+        if deviceLockedForCustomFormat, let device = currentDevice {
+            device.unlockForConfiguration()
+            deviceLockedForCustomFormat = false
+        }
     }
     
     func capturePhoto() -> NSImage? {
@@ -787,6 +822,11 @@ func main() -> Int32 {
     
     Output.quiet = args.quiet
     Output.verbose = args.verbose
+    
+    if let err = args.parseError {
+        Output.error(err)
+        return 1
+    }
     
     if args.showHelp {
         Arguments.printHelp()
